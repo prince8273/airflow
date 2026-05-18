@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import attr
 
@@ -80,6 +80,18 @@ class DepContext:
     ignore_ti_state: bool = False
     ignore_unmapped_tasks: bool = False
     finished_tis: list[TaskInstance] | None = None
+
+    # Scheduler-populated batch caches. Populated once in DagRun._get_ready_tis
+    # before the per-TI dep-evaluation loop and consumed read-only inside each dep.
+    # Kept as init=True (attrs default) so attrs.evolve() carries them through
+    # the UP_FOR_RESCHEDULE copy in TaskInstance.are_dependencies_met() without
+    # dropping the prefetched data.
+    # Never pass these from call sites -- default None triggers the per-TI fallback.
+    _dag_paused_cache: dict[str, bool | None] | None = attr.ib(default=None, repr=False)
+    _dag_active_ti_count_cache: dict[str, int] | None = attr.ib(default=None, repr=False)
+    _pool_cache: dict[str, Any] | None = attr.ib(default=None, repr=False)
+    _pool_occupied_slots_cache: dict[str, int] | None = attr.ib(default=None, repr=False)
+
     description: str | None = None
 
     have_changed_ti_states: bool = False
