@@ -79,7 +79,7 @@ from airflow.models.taskmap import TaskMap
 from airflow.serialization.definitions.deadline import SerializedReferenceModels
 from airflow.serialization.definitions.notset import NOTSET, ArgNotSet, is_arg_set
 from airflow.ti_deps.dep_context import DepContext
-from airflow.ti_deps.dependencies_states import SCHEDULEABLE_STATES
+from airflow.ti_deps.dependencies_states import EXECUTION_STATES, SCHEDULEABLE_STATES
 from airflow.utils.helpers import chunks, is_container, prune_dict
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.retries import retry_db_transaction
@@ -1446,6 +1446,58 @@ class DagRun(Base, LoggingMixin):
             ignore_unmapped_tasks=True,  # Ignore this Dep, as we will expand it if we can.
             finished_tis=finished_tis,
         )
+
+        # Batch prefetch: eliminate per-TI dep queries.
+        # DagUnpausedDep, DagTISlotsAvailableDep, and PoolSlotsAvailableDep each
+        # issue 1-2 DB queries per task instance. With N schedulable TIs that is
+        # O(N) queries per scheduling loop. We pre-populate four caches on
+        # dep_context here -- at most 4 round-trips total -- so each dep can read
+        # from the cache instead. Each dep falls back to its original per-TI query
+        # when the cache is None (i.e. when called outside the scheduler loop).
+        _dag_ids: set[str] = {ti.dag_id for ti in schedulable_tis}
+        _pool_names: set[str] = {ti.pool for ti in schedulable_tis}
+
+        from airflow.models.dag import DagModel
+        from airflow.models.pool import Pool
+
+        # 1 query: is_paused for every dag_id in this scheduling batch.
+        dep_context._dag_paused_cache = dict(
+            session.execute(select(DagModel.dag_id, DagModel.is_paused).where(DagModel.dag_id.in_(_dag_ids)))
+        )
+
+        # 1 query: running TI count per dag_id -- mirrors get_concurrency_reached().
+        dep_context._dag_active_ti_count_cache = {
+            dag_id: count
+            for dag_id, count in session.execute(
+                select(TI.dag_id, func.count())
+                .where(TI.dag_id.in_(_dag_ids), TI.state == TaskInstanceState.RUNNING)
+                .group_by(TI.dag_id)
+            )
+        }
+
+        # 1 query: pool rows for slot limits and team validation.
+        dep_context._pool_cache = {
+            p.pool: p for p in session.scalars(select(Pool).where(Pool.pool.in_(_pool_names)))
+        }
+
+        # 1-2 queries: occupied slot sum per pool, split on include_deferred to
+        # mirror pool.occupied_slots() / pool.get_occupied_states() exactly.
+        _pool_occ: dict[str, int] = {}
+        _deferred_pools = {name for name, p in dep_context._pool_cache.items() if p.include_deferred}
+        _non_deferred_pools = _pool_names - _deferred_pools
+        for _pnames, _states in (
+            (_non_deferred_pools, EXECUTION_STATES),
+            (_deferred_pools, EXECUTION_STATES | {TaskInstanceState.DEFERRED}),
+        ):
+            if not _pnames:
+                continue
+            for pool_name, total in session.execute(
+                select(TI.pool, func.sum(TI.pool_slots))
+                .where(TI.pool.in_(_pnames), TI.state.in_(_states))
+                .group_by(TI.pool)
+            ):
+                _pool_occ[pool_name] = int(total or 0)
+        dep_context._pool_occupied_slots_cache = _pool_occ
 
         def _expand_mapped_task_if_needed(ti: TI) -> Iterable[TI] | None:
             """
