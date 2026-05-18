@@ -30,13 +30,16 @@ class DagUnpausedDep(BaseTIDep):
     IGNORABLE = True
 
     @staticmethod
-    def _is_dag_paused(dag_id: str, session) -> bool:
+    def _is_dag_paused(dag_id: str, session, dep_context=None) -> bool:
         """Check if a dag is paused. Extracted to simplify testing."""
+        if dep_context is not None and dep_context._dag_paused_cache is not None:
+            return bool(dep_context._dag_paused_cache.get(dag_id))
+
         from airflow.models.dag import DagModel
 
         return session.scalar(select(DagModel.is_paused).where(DagModel.dag_id == dag_id))
 
     @provide_session
     def _get_dep_statuses(self, ti, session, dep_context):
-        if self._is_dag_paused(ti.dag_id, session):
+        if self._is_dag_paused(ti.dag_id, session, dep_context):
             yield self._failing_status(reason=f"Task's DAG '{ti.dag_id}' is paused.")

@@ -47,8 +47,12 @@ class PoolSlotsAvailableDep(BaseTIDep):
 
         pool_name = ti.pool
 
-        # Controlled by UNIQUE key in slot_pool table, only (at most) one result can be returned.
-        pool: Pool | None = session.scalar(select(Pool).where(Pool.pool == pool_name))
+        # Use scheduler-batch cache when available; falls back to per-TI query.
+        if dep_context is not None and dep_context._pool_cache is not None:
+            pool: Pool | None = dep_context._pool_cache.get(pool_name)
+        else:
+            # Controlled by UNIQUE key in slot_pool table, only (at most) one result.
+            pool = session.scalar(select(Pool).where(Pool.pool == pool_name))
         if pool is None:
             yield self._failing_status(
                 reason=f"Tasks using non-existent pool '{pool_name}' will not be scheduled"
@@ -70,7 +74,13 @@ class PoolSlotsAvailableDep(BaseTIDep):
                 )
                 return
 
-        open_slots = pool.open_slots(session=session)
+        # Use scheduler-batch cache when available; mirrors pool.open_slots() exactly,
+        # including the float("inf") sentinel for unlimited pools (slots == -1).
+        if dep_context is not None and dep_context._pool_occupied_slots_cache is not None:
+            occupied = dep_context._pool_occupied_slots_cache.get(pool_name, 0)
+            open_slots: int | float = float("inf") if pool.slots == -1 else pool.slots - occupied
+        else:
+            open_slots = pool.open_slots(session=session)
         if ti.state in pool.get_occupied_states():
             open_slots += ti.pool_slots
 

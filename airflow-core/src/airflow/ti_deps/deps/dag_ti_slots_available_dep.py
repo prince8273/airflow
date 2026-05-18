@@ -29,10 +29,17 @@ class DagTISlotsAvailableDep(BaseTIDep):
 
     @provide_session
     def _get_dep_statuses(self, ti, session, dep_context):
-        if ti.task.dag.get_concurrency_reached(session):
+        dag = ti.task.dag
+        if dep_context is not None and dep_context._dag_active_ti_count_cache is not None:
+            concurrency_reached = (
+                dep_context._dag_active_ti_count_cache.get(ti.dag_id, 0) >= dag.max_active_tasks
+            )
+        else:
+            concurrency_reached = dag.get_concurrency_reached(session)
+        if concurrency_reached:
             yield self._failing_status(
                 reason=(
-                    f"The maximum number of running tasks ({ti.task.dag.max_active_tasks}) for "
+                    f"The maximum number of running tasks ({dag.max_active_tasks}) for "
                     f"this task's DAG '{ti.dag_id}' has been reached."
                 )
             )
